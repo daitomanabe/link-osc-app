@@ -1,6 +1,6 @@
 # link-audio-osc (LinkOSC)
 
-**Receive Ableton Link Audio, analyze it, and send OSC — a macOS utility for audio-reactive visuals.**
+**Receive Ableton Link Audio or a macOS audio input, analyze it, and send OSC — a macOS utility for audio-reactive visuals.**
 
 [![Release](https://img.shields.io/github/v/release/daitomanabe/link-osc-app)](https://github.com/daitomanabe/link-osc-app/releases)
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPL--2.0--or--later-blue.svg)](LICENSE)
@@ -17,9 +17,10 @@ against LinkOSC.
 
 LinkOSC joins an [Ableton Link](https://github.com/Ableton/link) session, subscribes to a
 **Link Audio** channel (Live 12.4+ publishes its tracks/Main natively — no BlackHole or
-virtual audio driver needed), runs a realtime analysis chain, and streams the results as
-OSC to up to 4 destinations. Beat position comes from the Link timeline. A dev mode loops
-a bundled WAV + MIDI at a fixed BPM so you can build OSC receivers without Live running.
+virtual audio driver needed) or a selected macOS input device, runs a realtime analysis
+chain, and streams the results as OSC to up to 4 destinations. Beat position comes from
+the Link timeline. A dev mode loops a bundled WAV + MIDI at a fixed BPM so you can build
+OSC receivers without Live running.
 
 Built with SwiftUI + Metal + Accelerate (vDSP) + the official Link SDK (`abl_link` C API).
 Apple Silicon, macOS 13+.
@@ -86,8 +87,17 @@ queueing unboundedly. Verify pacing with `./.build/debug/LinkOSC --pacetest <por
 
 **Monitoring**: the Monitor column has a mute toggle and volume fader for the
 audible output — they control both the dev-mode WAV playback and a built-in
-monitor of the received Link Audio stream (jitter-buffered). Muting or changing
-volume never affects analysis or OSC output.
+monitor of the received Link Audio stream (jitter-buffered). Local input devices
+are not played back, preventing microphone feedback. Muting or changing volume
+never affects analysis or OSC output. Analysis gain has two modes: **Auto**
+summarizes each 4-second block (minimum, maximum, median, average and peak),
+updates once at the block boundary, and holds that gain for the next block. It
+targets a 0.95 peak, permits brief overshoot up to 1.05, and clamps published
+analysis values to 0...1;
+**Manual** exposes the `×0.1…×8.0` gain fader. The selected mode and manual value
+are saved. The Monitor header's **Adjusted / Raw** selector changes only the
+on-screen spectrum, L/R meters, and history: Adjusted shows the gain-processed
+signal, while Raw shows the input before analysis gain. OSC output is unchanged.
 
 **UI**: two-column layout (settings left, monitor right) sized for up to 1280×900 —
 tall enough that the settings column never scrolls, and shrinkable to 620 pt high
@@ -130,6 +140,7 @@ completely unaffected. `/ping 1` is sent every 500 ms as a receiver keepalive.
 2. First launch: the app is ad-hoc signed (not notarized) — right-click → **Open**,
    or `xattr -dr com.apple.quarantine LinkOSC.app`
 3. Allow **Local Network** access when prompted (required for Link's UDP multicast)
+4. If you select a macOS input device, also allow **Microphone** access when prompted
 
 ## Use with Ableton Live 12.4+
 
@@ -138,9 +149,17 @@ completely unaffected. `/ping 1` is sent every 500 ms as a receiver keepalive.
 1. In Live: Settings → Link → **Link Audio: On**, *and* turn on the **LINK toggle in
    Live's top bar** (if Live's Peers list says "Enable Link to show available peers",
    Link itself is still off)
-2. In LinkOSC, pick a channel — `Live | Main` is the master output. Audio can take a few
-   seconds to start; the channel list re-polls every 2 s and ↻ restarts discovery
+2. In LinkOSC, choose **Ableton Link Audio** under Audio Input, then pick a channel —
+   `Live | Main` is the master output. Audio can take a few seconds to start; the channel
+   list re-polls every 2 s and ↻ restarts discovery
 3. Enable OSC destinations (host/port). Everything is saved automatically
+
+To analyze a microphone, audio interface, aggregate device, or virtual device instead,
+select it from **Audio Input → Source**. The stable Core Audio device UID is saved. Link
+can remain enabled so `/beat` still follows the Link session while audio comes from the
+selected device. For multi-channel interfaces, choose a non-overlapping stereo pair
+(`Stereo 1–2`, `Stereo 3–4`, …) or an individual input (`Mono 1`, `Mono 2`, …) from
+the **Channel** menu.
 
 Verify with the bundled monitor: `python3 tools/osc_monitor.py 9001`
 
@@ -177,6 +196,8 @@ CLI diagnostics (debug build: `swift build`):
 ./.build/debug/LinkOSC --devtest 9099   # dev-mode loop + full analysis self-test
 ./.build/debug/LinkOSC --selftest 9099  # FFT calibration / Link timeline / OSC encoding
 ./.build/debug/LinkOSC --ifacetest      # interface pinning: enumerate NICs, prove routing constraint, multicast egress
+./.build/debug/LinkOSC --inputtest --capture  # enumerate inputs; also capture when permission is already granted
+./.build/debug/LinkOSC --autogaintest   # automatic-gain block hold / statistics / silence regression
 ./.build/debug/LinkOSC --docshot out.png 12   # self-screenshot of the live UI (regenerates the docs images)
 ```
 

@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import Accelerate
 import Network
+import AVFoundation
 
 struct DestConfig: Codable, Equatable {
     var enabled: Bool = false
@@ -25,6 +26,8 @@ final class LiveStats {
         var vol: Float = 0
         var receivingRate: Double = 0
         var audioFlowing = false
+        var effectiveGain: Float = 1
+        var inputRMS: Float = 0
         var noveltyValue: Float = 0
         var attackCount = 0
         var pattackCount = 0
@@ -114,11 +117,23 @@ final class LiveStats {
         }
     }
 
+    final class GainControl: ObservableObject {
+        struct Snapshot: Equatable {
+            var effectiveGain: Float = 1
+            var inputRMS: Float = 0
+        }
+        @Published private(set) var snapshot = Snapshot()
+        func update(_ next: Snapshot) {
+            if snapshot != next { snapshot = next }
+        }
+    }
+
     let transport = Transport()
     let signal = Signal()
     let events = Events()
     let destinations = Destinations()
     let autoBPM = AutoBPM()
+    let gainControl = GainControl()
     var lastNote: String { events.lastNote }
 
     func update(_ next: Values) {
@@ -132,6 +147,8 @@ final class LiveStats {
             sectionCount: next.sectionCount, lastNote: next.lastNote))
         destinations.update(Destinations.Snapshot(
             states: next.destStates, via: next.destVia))
+        gainControl.update(GainControl.Snapshot(
+            effectiveGain: next.effectiveGain, inputRMS: next.inputRMS))
     }
 }
 
@@ -145,9 +162,39 @@ final class AppModel: ObservableObject {
     @Published var selectedChannelKey: String {
         didSet { saveSettings() }
     }
+    /// "link" or "device:<CoreAudio UID>". Device UIDs are stable across launches.
+    @Published var selectedInputKey: String {
+        didSet {
+            let normalized = normalizedInputChannelKey(
+                for: selectedInputKey, requested: selectedInputChannelKey)
+            if normalized != selectedInputChannelKey {
+                selectedInputChannelKey = normalized
+                return
+            }
+            saveSettings()
+            if !devMode { applyInputSource() }
+        }
+    }
+    @Published var selectedInputChannelKey: String {
+        didSet {
+            saveSettings()
+            if !devMode, selectedInputKey != Self.linkInputKey { applyInputSource() }
+        }
+    }
     /// 連続操作は ContentView 全体を invalidate しない。FaderControls が
     /// ローカル @State を持ち、ここには解析用の値だけを反映する。
     private(set) var gain: Double
+    @Published var gainMode: InputGainMode {
+        didSet {
+            saveSettings()
+            RuntimeLog.shared.event("gain_mode_changed", ["mode": gainMode.rawValue.lowercased()])
+        }
+    }
+    /// Selects only the on-screen signal-level graphs. Analysis and OSC always
+    /// keep using the configured Auto/Manual gain path.
+    @Published var visualizationLevelMode: VisualizationLevelMode {
+        didSet { saveSettings(updateSnapshot: false) }
+    }
     @Published var beatOnlyWhenPlaying: Bool {
         didSet { saveSettings() }
     }
@@ -228,18 +275,25 @@ final class AppModel: ObservableObject {
     @Published var ifaceMissing = false
 
     let vizState = VizState()
+    let rawVizState = VizState()
     let stats = LiveStats()
     private let linkMonitor = MonitorOutput()
 
     // 低頻度の UI 表示用
     @Published var channelKeys: [String] = []
+    @Published private(set) var audioInputDevices: [AudioInputDevice] = []
+    @Published var audioInputError: String?
 
     private let engine = LinkEngine()
+    private let systemInput = SystemAudioInput()
     private let looper = DevLooper()
     private let analyzer = SpectrumAnalyzer()
     private let kit = AnalysisKit()
     private let sectionDetector = SectionDetector()
     private let autoBPMDetector = AutoBPMDetector()
+    private var autoGainController = AutoGainController()
+    private var lastGainMode = InputGainMode.manual
+    private var lastGainInputSignature = ""
     private var bufL = [Float](repeating: 0, count: SpectrumAnalyzer.fftSize)
     private var bufR = [Float](repeating: 0, count: SpectrumAnalyzer.fftSize)
     private var lastBar = Int.min
@@ -253,6 +307,8 @@ final class AppModel: ObservableObject {
     /// AVAudioEngine start/stop is isolated from the 60fps Link/OSC loop.
     /// CoreAudio teardown must never be able to block OSC transmission.
     private let devAudioQueue = DispatchQueue(label: "linkosc.dev-audio-control", qos: .userInitiated)
+    /// Core Audio device start/stop can block briefly and must not run on loopQueue.
+    private let inputAudioQueue = DispatchQueue(label: "linkosc.input-audio-control", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private let heartbeatLock = NSLock()
     private var lastHeartbeatNS = DispatchTime.now().uptimeNanoseconds
@@ -260,6 +316,8 @@ final class AppModel: ObservableObject {
     private var watchdogTimer: DispatchSourceTimer?
     private var devTransitionGeneration: UInt64 = 0
     private let devTransitionLock = NSLock()
+    private var inputTransitionGeneration: UInt64 = 0
+    private let inputTransitionLock = NSLock()
 
     private var senders: [OSCDestination?] = [nil, nil, nil, nil]
     private var sendRotation = 0
@@ -283,12 +341,18 @@ final class AppModel: ObservableObject {
     private var gateHpss = StreamGate()
     private var gateChroma = StreamGate()
     private var samples = [Float](repeating: 0, count: SpectrumAnalyzer.fftSize)
+    private var rawVizSpectrum = [Float](repeating: 0, count: SpectrumAnalyzer.bands)
+    private var rawVizHSpectrum = [Float](repeating: 0, count: SpectrumAnalyzer.bands)
+    private var rawVizPSpectrum = [Float](repeating: 0, count: SpectrumAnalyzer.bands)
 
     // メインスレッドの設定値をループスレッドへ渡すスナップショット
     private struct Snapshot {
         var dests: [DestConfig] = []
         var desired = ""
+        var inputSourceKey = "link"
+        var inputChannelKey = "stereo:0:1"
         var gain: Float = 1
+        var gainMode = InputGainMode.manual
         var beatGate = false
         var destsDirty = true
         var devMode = false
@@ -327,8 +391,12 @@ final class AppModel: ObservableObject {
         var dests: [DestConfig]
         var channel: String
         var gain: Double
+        var gainMode: String?
+        var visualizationLevelMode: String?
         var beatOnlyWhenPlaying: Bool
         var linkEnabled: Bool
+        var inputSourceKey: String?
+        var inputChannelKey: String?
         // 後から追加した項目 (古い保存データに無くても読めるよう optional)
         var devMode: Bool?
         var devFilePath: String?
@@ -368,6 +436,7 @@ final class AppModel: ObservableObject {
     static let defaultDevFile = bundledResource("loop-test", "wav")
     static let defaultDevEffectsFile = bundledResource("loop-test-effects", "wav")
     static let defaultDevMidi = bundledResource("loop-test", "mid")
+    static let linkInputKey = "link"
 
     init() {
         RuntimeLog.shared.event("app_start", [
@@ -381,9 +450,27 @@ final class AppModel: ObservableObject {
            let loaded = try? JSONDecoder().decode(Settings.self, from: data) {
             s = loaded
         }
+        let devices = SystemAudioInput.devices()
+        let restoredInput = s.inputSourceKey ?? Self.linkInputKey
+        let validInput = restoredInput == Self.linkInputKey
+            || devices.contains(where: { $0.key == restoredInput })
+        let resolvedInput = validInput ? restoredInput : Self.linkInputKey
+        let selectedDevice = devices.first(where: { $0.key == resolvedInput })
+        let channelOptions = selectedDevice.map {
+            AudioInputChannelSelection.options(channelCount: $0.channelCount)
+        } ?? []
+        let savedInputChannel = s.inputChannelKey ?? "stereo:0:1"
+        let resolvedInputChannel = channelOptions.first(where: { $0.key == savedInputChannel })?.key
+            ?? channelOptions.first?.key ?? savedInputChannel
+
         dests = s.dests
         selectedChannelKey = s.channel
+        selectedInputKey = resolvedInput
+        selectedInputChannelKey = resolvedInputChannel
         gain = s.gain
+        gainMode = InputGainMode(rawValue: s.gainMode ?? "") ?? .manual
+        visualizationLevelMode = VisualizationLevelMode(
+            rawValue: s.visualizationLevelMode ?? "") ?? .adjusted
         beatOnlyWhenPlaying = s.beatOnlyWhenPlaying
         linkEnabled = s.linkEnabled
         devMode = s.devMode ?? false
@@ -422,6 +509,8 @@ final class AppModel: ObservableObject {
         monitorMuted = s.monitorMuted ?? false
         monitorVolume = s.monitorVolume ?? 0.8
         ifaceName = s.ifaceName ?? ""
+        audioInputDevices = devices
+        audioInputError = validInput ? nil : "The saved input device is unavailable; using Ableton Link Audio."
 
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
@@ -435,7 +524,11 @@ final class AppModel: ObservableObject {
         netMonitor.onChange = { [weak self] in self?.networkChanged() }
         netMonitor.start(queue: loopQueue)
         publishSnapshot(destsChanged: true)
-        if devMode { applyDevMode() }
+        if devMode {
+            applyDevMode()
+        } else {
+            applyInputSource()
+        }
         startLoop()
         startWatchdog()
     }
@@ -485,10 +578,139 @@ final class AppModel: ObservableObject {
         saveContinuousSetting(updateSnapshot: false)
     }
 
-    /// Link Audio チャンネルの再探索 (Refresh ボタン)
-    func refreshChannels() {
+    var isLinkAudioSelected: Bool { selectedInputKey == Self.linkInputKey }
+    var selectedInputChannelOptions: [AudioInputChannelSelection] {
+        guard let device = audioInputDevices.first(where: { $0.key == selectedInputKey }) else {
+            return []
+        }
+        return AudioInputChannelSelection.options(channelCount: device.channelCount)
+    }
+
+    private func normalizedInputChannelKey(for sourceKey: String, requested: String) -> String {
+        guard let device = audioInputDevices.first(where: { $0.key == sourceKey }) else {
+            return requested
+        }
+        let options = AudioInputChannelSelection.options(channelCount: device.channelCount)
+        return options.first(where: { $0.key == requested })?.key ?? options.first?.key ?? requested
+    }
+
+    /// Core Audio devices and Link Audio channels are refreshed together.
+    func refreshInputs() {
+        if isLinkAudioSelected {
+            loopQueue.async { [self] in
+                engine.restartAudioDiscovery()
+            }
+        }
+        inputAudioQueue.async { [weak self] in
+            let devices = SystemAudioInput.devices()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.audioInputDevices = devices
+                if self.selectedInputKey != Self.linkInputKey,
+                   !devices.contains(where: { $0.key == self.selectedInputKey }) {
+                    self.audioInputError = "The selected input device is unavailable; using Ableton Link Audio."
+                    self.selectedInputKey = Self.linkInputKey
+                } else {
+                    let normalized = self.normalizedInputChannelKey(
+                        for: self.selectedInputKey, requested: self.selectedInputChannelKey)
+                    if normalized != self.selectedInputChannelKey {
+                        self.selectedInputChannelKey = normalized
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyInputSource() {
+        let key = selectedInputKey
+        let generation = nextInputTransitionGeneration()
+
+        if key == Self.linkInputKey {
+            inputAudioQueue.async { [self] in
+                guard isCurrentInputTransition(generation) else { return }
+                systemInput.stop()
+                DispatchQueue.main.async {
+                    guard self.isCurrentInputTransition(generation) else { return }
+                    self.audioInputError = nil
+                }
+            }
+            RuntimeLog.shared.event("audio_input_selected", ["source": "link_audio"])
+            return
+        }
+
+        guard let device = audioInputDevices.first(where: { $0.key == key }) else {
+            audioInputError = "The selected input device is unavailable."
+            return
+        }
+        let options = AudioInputChannelSelection.options(channelCount: device.channelCount)
+        guard let channel = options.first(where: { $0.key == selectedInputChannelKey })
+                ?? options.first else {
+            audioInputError = "The selected input device has no usable channels."
+            return
+        }
+
+        // Link remains enabled for tempo/beat, but its audio subscription and
+        // monitor are detached while a local Core Audio device is selected.
         loopQueue.async { [self] in
-            engine.restartAudioDiscovery()
+            engine.removeSource()
+            linkMonitor.stop()
+        }
+        inputAudioQueue.async { [self] in
+            guard isCurrentInputTransition(generation) else { return }
+            systemInput.stop()
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startSystemInput(device, channel: channel, generation: generation)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self, self.isCurrentInputTransition(generation) else { return }
+                    if granted {
+                        self.startSystemInput(device, channel: channel, generation: generation)
+                    } else {
+                        self.audioInputError = "Microphone access was denied. Enable LinkOSC in System Settings → Privacy & Security → Microphone."
+                    }
+                }
+            }
+        case .denied, .restricted:
+            audioInputError = "Microphone access is unavailable. Enable LinkOSC in System Settings → Privacy & Security → Microphone."
+        @unknown default:
+            audioInputError = "Microphone access could not be determined."
+        }
+    }
+
+    private func startSystemInput(
+        _ device: AudioInputDevice,
+        channel: AudioInputChannelSelection,
+        generation: UInt64
+    ) {
+        inputAudioQueue.async { [self] in
+            guard isCurrentInputTransition(generation) else { return }
+            let started = DispatchTime.now().uptimeNanoseconds
+            do {
+                try systemInput.start(deviceID: device.deviceID, channel: channel)
+                let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                RuntimeLog.shared.event("audio_input_started", [
+                    "source": "core_audio",
+                    "channel": channel.key,
+                    "duration_ms": String(format: "%.1f", elapsedMS)
+                ])
+                DispatchQueue.main.async {
+                    guard self.isCurrentInputTransition(generation) else { return }
+                    self.audioInputError = nil
+                }
+            } catch {
+                RuntimeLog.shared.event("audio_input_failed", [
+                    "source": "core_audio",
+                    "error": error.localizedDescription
+                ])
+                DispatchQueue.main.async {
+                    guard self.isCurrentInputTransition(generation) else { return }
+                    self.audioInputError = "Audio input failed: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -511,6 +733,10 @@ final class AppModel: ObservableObject {
         let midiPath = devMidiPath
         let linkOn = linkEnabled
         let generation = nextDevTransitionGeneration()
+        if on {
+            _ = nextInputTransitionGeneration()
+            inputAudioQueue.async { [systemInput] in systemInput.stop() }
+        }
         RuntimeLog.shared.event("dev_mode_requested", [
             "enabled": String(on),
             "generation": String(generation),
@@ -591,6 +817,7 @@ final class AppModel: ObservableObject {
                 "running": String(looper.isRunning)
             ])
         }
+        if !on { applyInputSource() }
     }
 
     /// MIDI changes do not require AVAudioEngine teardown. Keeping them separate
@@ -644,6 +871,20 @@ final class AppModel: ObservableObject {
         return generation == devTransitionGeneration
     }
 
+    private func nextInputTransitionGeneration() -> UInt64 {
+        inputTransitionLock.lock()
+        inputTransitionGeneration &+= 1
+        let value = inputTransitionGeneration
+        inputTransitionLock.unlock()
+        return value
+    }
+
+    private func isCurrentInputTransition(_ generation: UInt64) -> Bool {
+        inputTransitionLock.lock()
+        defer { inputTransitionLock.unlock() }
+        return generation == inputTransitionGeneration
+    }
+
     /// トグルや Picker などの離散的な変更を保存する。
     /// OSC 送信先の再構築は宛先設定/NIC が変わったときだけ行う。
     private func saveSettings(updateSnapshot: Bool = true, destsChanged: Bool = false) {
@@ -670,7 +911,11 @@ final class AppModel: ObservableObject {
 
     private func persistSettings() {
         let s = Settings(dests: dests, channel: selectedChannelKey, gain: gain,
+                         gainMode: gainMode.rawValue,
+                         visualizationLevelMode: visualizationLevelMode.rawValue,
                          beatOnlyWhenPlaying: beatOnlyWhenPlaying, linkEnabled: linkEnabled,
+                         inputSourceKey: selectedInputKey,
+                         inputChannelKey: selectedInputChannelKey,
                          devMode: devMode, devFilePath: devFilePath, devBPM: devBPM,
                          devMidiPath: devMidiPath,
                          fftCurve: fftCurve.rawValue, volCurve: volCurve.rawValue,
@@ -694,7 +939,10 @@ final class AppModel: ObservableObject {
         settingsLock.lock()
         snapshot.dests = dests
         snapshot.desired = selectedChannelKey
+        snapshot.inputSourceKey = selectedInputKey
+        snapshot.inputChannelKey = selectedInputChannelKey
         snapshot.gain = Float(gain)
+        snapshot.gainMode = gainMode
         snapshot.beatGate = beatOnlyWhenPlaying
         snapshot.devMode = devMode
         snapshot.devBPM = devBPM
@@ -785,7 +1033,7 @@ final class AppModel: ObservableObject {
             }
         }
         let desired = snap.desired
-        let gainNow = snap.gain
+        let manualGain = snap.gain
         let beatGate = snap.beatGate
 
         var channelsChanged = false
@@ -796,6 +1044,8 @@ final class AppModel: ObservableObject {
         var tlPlaying = false
         var srNow = 0.0
         var devFramesNow: UInt64 = 0
+        var systemFramesNow: UInt64 = 0
+        let usingSystemInput = snap.inputSourceKey != Self.linkInputKey
 
         var midiNotes: [(note: UInt8, velocity: UInt8)] = []
         if snap.devMode {
@@ -811,18 +1061,27 @@ final class AppModel: ObservableObject {
             tlPlaying = looper.isRunning
             srNow = dev.sampleRate
         } else {
-            // チャンネル一覧の更新と購読の同期
-            channelsChanged = engine.refreshChannelsIfNeeded()
-            engine.syncSource(desiredKey: desired)
-            engine.latestStereo(SpectrumAnalyzer.fftSize, intoL: &bufL, intoR: &bufR)
-
+            // Link always supplies the timeline. Audio comes either from Link
+            // Audio or from the selected local Core Audio input device.
             let tl = engine.timeline()
             beatIdx = ((Int(floor(tl.beat)) % 4) + 4) % 4
             totalBeats = tl.beat
             tlPeers = tl.peers
             tlTempo = tl.tempo
             tlPlaying = tl.isPlaying
-            srNow = engine.sampleRate
+            if usingSystemInput {
+                systemInput.latestStereo(
+                    SpectrumAnalyzer.fftSize, intoL: &bufL, intoR: &bufR)
+                let inputStats = systemInput.stats()
+                systemFramesNow = inputStats.frames
+                srNow = inputStats.sampleRate
+            } else {
+                channelsChanged = engine.refreshChannelsIfNeeded()
+                engine.syncSource(desiredKey: desired)
+                engine.latestStereo(
+                    SpectrumAnalyzer.fftSize, intoL: &bufL, intoR: &bufR)
+                srNow = engine.sampleRate
+            }
         }
 
         // モノラルミックス → FFT フレーム
@@ -830,7 +1089,22 @@ final class AppModel: ObservableObject {
         vDSP_vadd(bufL, 1, bufR, 1, &samples, 1, vDSP_Length(nSamp))
         var half: Float = 0.5
         vDSP_vsmul(samples, 1, &half, &samples, 1, vDSP_Length(nSamp))
-        let frame = analyzer.analyzeFrame(samples, gain: gainNow)
+        var inputRMS: Float = 0
+        var inputPeak: Float = 0
+        vDSP_rmsqv(samples, 1, &inputRMS, vDSP_Length(nSamp))
+        vDSP_maxmgv(samples, 1, &inputPeak, vDSP_Length(nSamp))
+
+        let gainSignature = snap.devMode
+            ? "dev" : "\(snap.inputSourceKey)|\(snap.inputChannelKey)"
+        if snap.gainMode != lastGainMode || gainSignature != lastGainInputSignature {
+            autoGainController.reset(to: snap.gainMode == .automatic ? 1 : manualGain)
+            lastGainMode = snap.gainMode
+            lastGainInputSignature = gainSignature
+        }
+        let effectiveGain = snap.gainMode == .automatic
+            ? autoGainController.process(rms: inputRMS, peak: inputPeak)
+            : manualGain
+        let frame = analyzer.analyzeFrame(samples, gain: effectiveGain)
 
         // attack / pattack / novelty / chroma / HPSS
         // チェックが付いている解析だけを計算して使用する
@@ -908,20 +1182,56 @@ final class AppModel: ObservableObject {
                 vDSP_svesq(bufL, 1, &el, vDSP_Length(nSamp))
                 vDSP_svesq(bufR, 1, &er, vDSP_Length(nSamp))
                 let cDenom = sqrtf(el * er)
+                let corr = cDenom > 1e-9 ? max(-1, min(1, dot / cDenom)) : 1
                 vizState.set(VizState.Data(
                     spectrum: spec,
-                    rmsL: min(rl * gainNow * 1.4, 1),
-                    rmsR: min(rr * gainNow * 1.4, 1),
-                    corr: cDenom > 1e-9 ? max(-1, min(1, dot / cDenom)) : 1,
+                    rmsL: min(rl * effectiveGain * 1.4, 1),
+                    rmsR: min(rr * effectiveGain * 1.4, 1),
+                    corr: corr,
                     harmonic: res.harmonic,
                     percussive: res.percussive,
                     chroma: res.chroma,
                     hSpectrum: hSpec,
                     pSpectrum: pSpec))
+
+                // Build the Raw display from the already-computed FFT
+                // magnitudes. This avoids a second FFT and does not touch the
+                // adjusted analysis/OSC path.
+                let inverseGain = 1 / max(effectiveGain, 1e-9)
+                let group = frame.mags.count / SpectrumAnalyzer.bands
+                for band in 0..<SpectrumAnalyzer.bands {
+                    var magnitude: Float = 0
+                    for bin in 0..<group {
+                        magnitude = max(magnitude, frame.mags[band * group + bin])
+                    }
+                    rawVizSpectrum[band] = snap.fftCurve.apply(magnitude * inverseGain)
+                    rawVizHSpectrum[band] = snap.sendHFFT
+                        ? snap.fftCurve.apply(res.hBands[band] * inverseGain) : 0
+                    rawVizPSpectrum[band] = snap.sendPFFT
+                        ? snap.fftCurve.apply(res.pBands[band] * inverseGain) : 0
+                }
+                let rootInverseGain = 1 / sqrtf(max(effectiveGain, 1e-9))
+                rawVizState.set(VizState.Data(
+                    spectrum: rawVizSpectrum,
+                    rmsL: min(rl * 1.4, 1),
+                    rmsR: min(rr * 1.4, 1),
+                    corr: corr,
+                    harmonic: min(res.harmonic * rootInverseGain, 1),
+                    percussive: min(res.percussive * rootInverseGain, 1),
+                    chroma: res.chroma,
+                    hSpectrum: rawVizHSpectrum,
+                    pSpectrum: rawVizPSpectrum))
             }
             vizState.pushHistory(VizState.HistoryPoint(
                 vol: rms, novelty: res.novelty,
                 harmonic: res.harmonic, percussive: res.percussive,
+                attack: res.attack != nil, pattack: res.pattack != nil,
+                section: sectionChange != nil))
+            let rootInverseGain = 1 / sqrtf(max(effectiveGain, 1e-9))
+            rawVizState.pushHistory(VizState.HistoryPoint(
+                vol: snap.volCurve.apply(inputRMS), novelty: res.novelty,
+                harmonic: min(res.harmonic * rootInverseGain, 1),
+                percussive: min(res.percussive * rootInverseGain, 1),
                 attack: res.attack != nil, pattack: res.pattack != nil,
                 section: sectionChange != nil))
         }
@@ -1008,8 +1318,14 @@ final class AppModel: ObservableObject {
         let uiEvery = snap.liteMode ? 60 : 6
         if frameCount % uiEvery == 0 || channelsChanged {
             let keys = engine.channels.map { $0.key }
-            let (frames, rate) = snap.devMode
-                ? (devFramesNow, srNow) : engine.stats()
+            let (frames, rate): (UInt64, Double)
+            if snap.devMode {
+                (frames, rate) = (devFramesNow, srNow)
+            } else if usingSystemInput {
+                (frames, rate) = (systemFramesNow, srNow)
+            } else {
+                (frames, rate) = engine.stats()
+            }
             let flowing = frames != lastFrames
             lastFrames = frames
             // 宛先状態 (ドット表示用): ready でなければ connecting、
@@ -1050,6 +1366,8 @@ final class AppModel: ObservableObject {
                     vol: rms,
                     receivingRate: rate,
                     audioFlowing: flowing,
+                    effectiveGain: effectiveGain,
+                    inputRMS: inputRMS,
                     noveltyValue: nov,
                     attackCount: atk,
                     pattackCount: patk,

@@ -18,7 +18,7 @@ struct ContentView: View {
                     Divider()
                     linkSection
                     Divider()
-                    channelSection
+                    inputSection
                     Divider()
                     analysisSection
                     Divider()
@@ -154,35 +154,63 @@ struct ContentView: View {
         .opacity(model.devMode ? 0.45 : 1)
     }
 
-    private var channelSection: some View {
+    private var inputSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Link Audio Channel").font(.headline)
+                Text("Audio Input").font(.headline)
                 Button {
-                    model.refreshChannels()
+                    model.refreshInputs()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .help("Re-scan channels (restarts Link Audio discovery)")
+                .help("Re-scan macOS input devices and Link Audio channels")
                 Spacer()
             }
-            Picker("Input", selection: $model.selectedChannelKey) {
-                Text("(none)").tag("")
-                ForEach(model.channelKeys, id: \.self) { key in
-                    Text(key).tag(key)
-                }
-                if !model.selectedChannelKey.isEmpty,
-                   !model.channelKeys.contains(model.selectedChannelKey) {
-                    Text("\(model.selectedChannelKey) (waiting…)")
-                        .tag(model.selectedChannelKey)
+            Picker("Source", selection: $model.selectedInputKey) {
+                Text("Ableton Link Audio").tag(AppModel.linkInputKey)
+                Divider()
+                ForEach(model.audioInputDevices) { device in
+                    Text(device.displayName).tag(device.key)
                 }
             }
             .pickerStyle(.menu)
 
-            if model.channelKeys.isEmpty {
-                Text("If no channels appear: in the sending Live, check BOTH ① Settings → Link → Link Audio \"On\" and ② the main LINK toggle in Live's top bar. Also allow LinkOSC under macOS System Settings → Privacy & Security → Local Network.")
+            if model.isLinkAudioSelected {
+                Picker("Channel", selection: $model.selectedChannelKey) {
+                    Text("(none)").tag("")
+                    ForEach(model.channelKeys, id: \.self) { key in
+                        Text(key).tag(key)
+                    }
+                    if !model.selectedChannelKey.isEmpty,
+                       !model.channelKeys.contains(model.selectedChannelKey) {
+                        Text("\(model.selectedChannelKey) (waiting…)")
+                            .tag(model.selectedChannelKey)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                if model.channelKeys.isEmpty {
+                    Text("If no channels appear: in the sending Live, check BOTH ① Settings → Link → Link Audio \"On\" and ② the main LINK toggle in Live's top bar. Also allow LinkOSC under macOS System Settings → Privacy & Security → Local Network.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Picker("Channel", selection: $model.selectedInputChannelKey) {
+                    ForEach(model.selectedInputChannelOptions) { channel in
+                        Text(channel.label).tag(channel.key)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("The selected macOS device is analyzed directly. Monitor playback is disabled to prevent feedback; Ableton Link still supplies /beat timing when enabled.")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let error = model.audioInputError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -368,11 +396,22 @@ struct ContentView: View {
     // MARK: - Right column (monitor)
 
     private var monitorColumn: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let displayState = model.visualizationLevelMode == .raw
+            ? model.rawVizState : model.vizState
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Monitor").font(.headline)
                 Spacer()
                 LiveReceiving(stats: model.stats.transport)
+                Picker("Graph level", selection: $model.visualizationLevelMode) {
+                    ForEach(VisualizationLevelMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 150)
+                .help("Adjusted shows Auto/Manual gain; Raw shows the input before analysis gain. OSC output is unchanged.")
                 Toggle("Lite mode", isOn: $model.liteMode)
                     .toggleStyle(.switch)
                     .help("Pauses visualization rendering and slows UI updates to 1 Hz — analysis & OSC output are unaffected")
@@ -383,7 +422,8 @@ struct ContentView: View {
                         signal: model.stats.signal,
                         events: model.stats.events)
             } else {
-                MetalVisualizer(state: model.vizState)
+                MetalVisualizer(state: displayState)
+                    .id("main-\(model.visualizationLevelMode.rawValue)")
                     .frame(maxHeight: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 HStack {
@@ -393,13 +433,15 @@ struct ContentView: View {
                     Text("L R H P").font(.caption2.monospaced()).foregroundStyle(.secondary)
                 }
 
-                MetalChromaView(state: model.vizState)
+                MetalChromaView(state: displayState)
+                    .id("chroma-\(model.visualizationLevelMode.rawValue)")
                     .frame(height: 52)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .opacity(model.sendChroma ? 1 : 0.35)
                 ChromaLabels()
 
-                MetalHistoryView(state: model.vizState)
+                MetalHistoryView(state: displayState)
+                    .id("history-\(model.visualizationLevelMode.rawValue)")
                     .frame(height: 140)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 HistoryLegend()
@@ -418,12 +460,14 @@ private struct FaderControls: View {
     @State private var monitorMuted: Bool
     @State private var monitorVolume: Double
     @State private var gain: Double
+    @State private var gainMode: InputGainMode
 
     init(model: AppModel) {
         self.model = model
         _monitorMuted = State(initialValue: model.monitorMuted)
         _monitorVolume = State(initialValue: model.monitorVolume)
         _gain = State(initialValue: model.gain)
+        _gainMode = State(initialValue: model.gainMode)
     }
 
     var body: some View {
@@ -450,13 +494,43 @@ private struct FaderControls: View {
             }
             HStack {
                 Text("gain").font(.caption).foregroundStyle(.secondary)
-                Slider(value: $gain, in: 0.1...8.0)
-                    .onChange(of: gain) { model.setGain($0) }
-                Text(String(format: "×%.1f", gain))
-                    .font(.caption).monospacedDigit()
-                    .frame(width: 44, alignment: .trailing)
+                Picker("Gain mode", selection: $gainMode) {
+                    ForEach(InputGainMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 126)
+                .onChange(of: gainMode) { model.gainMode = $0 }
+
+                if gainMode == .automatic {
+                    AutoGainFader(stats: model.stats.gainControl)
+                } else {
+                    Slider(value: $gain, in: 0.1...8.0)
+                        .onChange(of: gain) { model.setGain($0) }
+                        .help("Manual analysis gain")
+                    Text(String(format: "×%.1f", gain))
+                        .font(.caption).monospacedDigit()
+                        .frame(width: 54, alignment: .trailing)
+                }
             }
         }
+    }
+}
+
+private struct AutoGainFader: View {
+    @ObservedObject var stats: LiveStats.GainControl
+
+    var body: some View {
+        Slider(
+            value: .constant(Double(stats.snapshot.effectiveGain)),
+            in: Double(AutoGainController.minimumGain)...Double(AutoGainController.maximumGain))
+            .disabled(true)
+            .help("Auto gain: hold for 4 seconds and normalize peaks near 0.95 (up to 1.05 before clamping)")
+        Text(String(format: "×%.1f", stats.snapshot.effectiveGain))
+            .font(.caption).monospacedDigit()
+            .frame(width: 54, alignment: .trailing)
     }
 }
 
@@ -610,7 +684,8 @@ private struct LiveVolMeter: View {
     @ObservedObject var stats: LiveStats.Signal
     var body: some View {
         HStack {
-            Text("/vol").font(.caption).foregroundStyle(.secondary)
+            Text("/vol OSC").font(.caption).foregroundStyle(.secondary)
+                .help("Actual outgoing /vol value; the Adjusted / Raw selector changes only the graphs above")
             // scaleEffect はレイアウトを再計算させない (GeometryReader だと毎更新で
             // ウィンドウ全体の AutoLayout パスが走る)
             ZStack(alignment: .leading) {

@@ -20,6 +20,10 @@ enum Main {
             DestTest.run()
         } else if CommandLine.arguments.contains("--ifacetest") {
             IfaceTest.run()
+        } else if CommandLine.arguments.contains("--inputtest") {
+            InputDeviceTest.run()
+        } else if CommandLine.arguments.contains("--autogaintest") {
+            AutoGainTest.run()
         } else if CommandLine.arguments.contains("--docshot") {
             DocShot.runStandalone()
         } else if CommandLine.arguments.contains("--pacetest") {

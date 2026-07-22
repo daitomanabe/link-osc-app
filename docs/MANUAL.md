@@ -1,15 +1,16 @@
 # LinkOSC User Manual
 
-*For app version 1.0.12. 日本語版は [MANUAL.ja.md](MANUAL.ja.md) にあります。*
+*For app version 1.0.17. 日本語版は [MANUAL.ja.md](MANUAL.ja.md) にあります。*
 
 LinkOSC receives audio from **Ableton Live over Link Audio** (no virtual audio
-driver), analyzes it at 60 fps, and streams the results as **OSC** to up to 4
+driver) or a selected macOS input device, analyzes it at 60 fps, and streams the results as **OSC** to up to 4
 destinations — for driving visuals in TouchDesigner, Max/MSP, openFrameworks,
 Unity, the browser, or anything else that speaks OSC.
 
 ```mermaid
 flowchart LR
     Live["Ableton Live 12.4+<br/>(Link + Link Audio)"] -- "audio over LAN" --> A
+    Input["macOS audio input<br/>(mic / interface / virtual)"] --> A
     WAV["Dev mode<br/>(bundled WAV + MIDI loop)"] --> A
     subgraph LinkOSC
         A["Receive"] --> B["Analyze @60fps<br/>FFT · HPSS · onsets ·<br/>novelty · chroma · section"]
@@ -55,7 +56,7 @@ flowchart LR
 Requirements: macOS 13+, Apple Silicon. All settings save automatically
 (UserDefaults) — there is no Save button anywhere.
 
-The window title shows the running version (e.g. `LinkOSC v1.0.12 (13)`).
+The window title shows the running version (e.g. `LinkOSC v1.0.17 (21)`).
 
 ## 2. Quick start with Ableton Live
 
@@ -70,7 +71,7 @@ The window title shows the running version (e.g. `LinkOSC v1.0.12 (13)`).
      toggle is still off.
 2. In LinkOSC, make sure **Ableton Link** is on and **Dev Mode** is off.
    `peers:` should become ≥ 1 and the tempo should track Live.
-3. Pick a channel in **Link Audio Channel** — `Live | Main` is Live's master
+3. Under **Audio Input**, select **Ableton Link Audio**, then pick a channel — `Live | Main` is Live's master
    output; every track is also published individually. Audio can take a few
    seconds to start flowing. The list re-polls every 2 s; the **↻** button
    restarts discovery if a channel you expect is missing.
@@ -85,6 +86,15 @@ The window title shows the running version (e.g. `LinkOSC v1.0.12 (13)`).
 Live's transport even if audio buffering adds latency. With
 **send /beat only while playing** checked, `/beat` pauses when Live's
 transport stops.
+
+To use a microphone, audio interface, aggregate device, or virtual input, select
+it from **Audio Input → Source**. Allow microphone access when macOS asks. Link
+may remain enabled: audio analysis uses the selected device while `/beat` still
+uses the Link timeline. Local inputs are deliberately not played through the
+monitor output, which prevents feedback. For multi-channel interfaces, the
+**Channel** menu offers non-overlapping stereo pairs (`Stereo 1–2`, `3–4`, …)
+and every individual mono input. The source and channel selections are restored
+at the next launch; an invalid saved channel falls back to the first valid pair.
 
 ## 3. Quick start without Live (Dev Mode)
 
@@ -283,9 +293,20 @@ cap — a stalled destination drops packets instead of queueing unboundedly
   nothing is flowing.
 - **monitor mute / volume** — controls the *audible* monitoring of the
   received Link Audio (jitter-buffered) or the dev-mode WAV. **It never
-  affects analysis or OSC.**
-- **gain** — input gain applied *before* analysis; affects `/fft` `/vol`
-  values and everything downstream. Use it to normalize a quiet source.
+  affects analysis or OSC.** Local audio inputs are not monitored to prevent feedback.
+- **gain Auto / Manual** — input gain applied *before* analysis; affects `/fft`
+  `/vol` and everything downstream. **Auto** targets a stable analysis level,
+  summarizes minimum, maximum, median, average and peak over each 4-second
+  block, updates only at the block boundary, and holds that gain for the next
+  block. It targets a 0.95 peak, allows brief overshoot up to 1.05 before the
+  published values are clamped to 0...1. Small changes are ignored and silence
+  is not amplified. **Manual**
+  exposes the `×0.1…×8.0` fader. The mode
+  and manual value are saved; switching back to Manual restores its last value.
+- **Adjusted / Raw** — selects the level shown by the on-screen spectrum, L/R
+  meters, and history. Adjusted includes Auto/Manual gain; Raw is the input
+  before analysis gain. Both histories are retained independently. This display
+  setting never changes analysis or OSC output.
 - **Lite mode** — stops all Metal rendering and slows UI updates to 1 Hz.
   Analysis and OSC continue at exactly 60 fps. Use it during the show once
   everything is verified.
@@ -336,6 +357,8 @@ Debug builds (`swift build`) expose self-tests — useful when something
 | `LinkOSC --rxtest 9099 Main` | subscribe to a channel and report received frames |
 | `LinkOSC --devtest 9099` | dev-mode loop + full analysis chain self-test |
 | `LinkOSC --bpmtest` | Auto BPM synthetic 90/110/128/140/180 tests + bundled WAV |
+| `LinkOSC --inputtest [--capture]` | Core Audio input enumeration and UID checks; optionally capture if permission is already granted |
+| `LinkOSC --autogaintest` | automatic-gain block hold, statistics, silence guard, deadband, and peak ceiling |
 | `LinkOSC --selftest 9099` | FFT calibration / Link timeline / OSC encoding |
 | `LinkOSC --ifacetest` | interface pinning: enumerates NICs, proves the routing constraint, verifies pinned multicast delivery |
 | `LinkOSC --desttest 9070` | per-destination filters / bundles / multicast |
