@@ -42,6 +42,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Used to join Ableton Link sessions (UDP multicast) and send OSC to devices on the local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used to analyze audio from the input device selected in LinkOSC and send OSC.</string>
 </dict>
 </plist>
 PLIST
